@@ -19,6 +19,14 @@ from typing import Iterable
 from urllib import error, parse, request
 
 
+def collect_payload_files(files: list[Path], dirs: list[Path]) -> list[Path]:
+    collected = list(files)
+    for directory in dirs:
+        collected.extend(path for path in sorted(directory.rglob("*")) if path.is_file())
+    # Keep stable order while removing duplicate paths.
+    return list(dict.fromkeys(collected))
+
+
 def iter_payloads(paths: list[Path], limit: int | None) -> Iterable[tuple[str, Path, int]]:
     emitted = 0
     seen: set[str] = set()
@@ -79,7 +87,8 @@ def send_request(args: argparse.Namespace, payload: str, payload_id: str, run_id
 def main() -> int:
     parser = argparse.ArgumentParser(description="Replay labeled payloads against an authorized open-appsec endpoint")
     parser.add_argument("--base-url", required=True, help="Target URL, for example https://app.example.com/search")
-    parser.add_argument("--payload-file", action="append", required=True, type=Path, help="Payload file; can be repeated")
+    parser.add_argument("--payload-file", action="append", default=[], type=Path, help="Payload file; can be repeated")
+    parser.add_argument("--payload-dir", action="append", default=[], type=Path, help="Directory with payload files; can be repeated")
     parser.add_argument("--param", default="q", help="Parameter name used for GET query or POST form body")
     parser.add_argument("--method", choices=("GET", "POST"), default="GET")
     parser.add_argument("--expected-label", choices=("true-positive", "false-positive"), default="true-positive")
@@ -96,6 +105,14 @@ def main() -> int:
     if not args.i_am_authorized:
         print("Refusing to send traffic without --i-am-authorized", file=sys.stderr)
         return 2
+    payload_paths = collect_payload_files(args.payload_file, args.payload_dir)
+    if not payload_paths:
+        print("Provide at least one --payload-file or --payload-dir", file=sys.stderr)
+        return 2
+    missing = [str(path) for path in payload_paths if not path.exists()]
+    if missing:
+        print("Missing payload files: " + ", ".join(missing), file=sys.stderr)
+        return 2
     if args.rate <= 0:
         print("--rate must be greater than zero", file=sys.stderr)
         return 2
@@ -110,7 +127,7 @@ def main() -> int:
             fieldnames=["run_id", "payload_id", "source_file", "source_line", "expected_label", "method", "status", "error"],
         )
         writer.writeheader()
-        for index, (payload, source_file, source_line) in enumerate(iter_payloads(args.payload_file, args.limit), 1):
+        for index, (payload, source_file, source_line) in enumerate(iter_payloads(payload_paths, args.limit), 1):
             payload_id = f"{args.run_id}-{index:06d}"
             status, err, _ = send_request(args, payload, payload_id, args.run_id)
             row = {

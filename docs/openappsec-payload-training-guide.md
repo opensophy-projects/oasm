@@ -453,3 +453,86 @@ python3 /workspace/oas1/scripts/payload_replay_runner.py \
 - persistent volumes можно бэкапить/переносить после обучения.
 
 Если боевой ingress у тебя не NPM, а обычный NGINX/Kong/APISIX/Envoy, тогда NPM используй только для первого canary-прогона, а финальную проверку делай на том же ingress-классе, что и production.
+
+## Что делать с runner на другом ПК/сервере
+
+Полный репозиторий на runner-сервере **не обязателен**. Runner написан на Python standard library, поэтому на другом ПК нужны только:
+
+1. `python3`;
+2. файл `scripts/payload_replay_runner.py`;
+3. подготовленные payload-файлы, например `true-positives.new-only.txt`;
+4. сетевой доступ до твоего canary/prod-like host за open-appsec.
+
+### Вариант 1: скопировать только runner и payloads
+
+На машине, где лежит репозиторий:
+
+```bash
+mkdir -p /tmp/oas-runner-bundle/payloads
+cp scripts/payload_replay_runner.py /tmp/oas-runner-bundle/
+cp /tmp/openappsec-payloads-clean/sqli/true-positives.new-only.txt /tmp/oas-runner-bundle/payloads/sqli.txt
+cp /tmp/openappsec-payloads-clean/cmdexe/true-positives.new-only.txt /tmp/oas-runner-bundle/payloads/cmdexe.txt
+tar -C /tmp -czf oas-runner-bundle.tgz oas-runner-bundle
+scp oas-runner-bundle.tgz user@runner-server:/tmp/
+```
+
+На другом сервере:
+
+```bash
+mkdir -p ~/oas-runner
+cd ~/oas-runner
+tar -xzf /tmp/oas-runner-bundle.tgz --strip-components=1
+python3 payload_replay_runner.py --help
+```
+
+Запуск по одному файлу:
+
+```bash
+python3 payload_replay_runner.py \
+  --base-url 'https://waf-train.example.com/search' \
+  --payload-file payloads/sqli.txt \
+  --param q \
+  --method GET \
+  --expected-label true-positive \
+  --rate 1 \
+  --limit 50 \
+  --output runs/sqli-smoke.jsonl \
+  --i-am-authorized
+```
+
+Запуск сразу по папке payloads:
+
+```bash
+python3 payload_replay_runner.py \
+  --base-url 'https://waf-train.example.com/search' \
+  --payload-dir payloads \
+  --param q \
+  --method GET \
+  --expected-label true-positive \
+  --rate 1 \
+  --limit 200 \
+  --output runs/all-smoke.jsonl \
+  --i-am-authorized
+```
+
+### Вариант 2: скачать весь репозиторий
+
+Так тоже можно, но это тяжелее и обычно не нужно. Делай так только если runner-серверу нужны все папки проекта и payloads прямо из рабочей копии:
+
+```bash
+git clone <URL_ТВОЕГО_РЕПОЗИТОРИЯ> oas1
+cd oas1
+python3 scripts/payload_replay_runner.py --help
+```
+
+Потом запускай так же, только путь до скрипта будет `scripts/payload_replay_runner.py`, а пути до payloads — внутри репозитория или в подготовленном `/tmp/openappsec-payloads-clean`.
+
+### Минимальный порядок действий
+
+1. На open-appsec/NPM стороне заведи отдельный host, например `waf-train.example.com`, и включи для него `Detect-Learn`.
+2. На runner-сервер скопируй `payload_replay_runner.py` и очищенные payload-файлы.
+3. Сначала запусти `--limit 10 --rate 1`, чтобы проверить, что запросы доходят и появляются в логах.
+4. Найди `run_id`, который runner печатает в конце.
+5. На open-appsec/NPM стороне найди этот `run_id` в `docker logs appsec-agent`, файлах `appsec-logs` или NPM Security Log.
+6. Если корреляция работает, увеличивай `--limit` и/или добавляй новые `--payload-file`/`--payload-dir`.
+7. Не запускай полный миллионный набор сразу: сначала smoke, потом категории, потом полный regression.
