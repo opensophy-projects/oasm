@@ -602,20 +602,14 @@ python3 scripts/payload_replay_runner.py --help
 4. прогнать false-positive набор;
 5. только потом переводить в Prevent.
 
-### Путь A: upload Snort-файла через WebUI
+### Только full local: что именно нужно
 
-Если ты используешь WebUI/Management Portal, рабочий сценарий такой:
+Если cloud/WebUI не нужен, пропускай upload-вариант полностью. Для full local нужен один из двух локальных вариантов:
 
-1. Открыть нужный Asset.
-2. Перейти в Web Attacks / Snort Signatures / IPS sub-practice.
-3. Загрузить `.rules` файл.
-4. Поставить режим Detect или Prevent.
-5. Нажать Enforce.
-6. Проверить Security Logs на маленьком smoke-наборе.
+1. **Локальный v1beta2 policy**, где есть `threatPreventionPractices.snortSignatures.files`. Это правильный путь для подключения локального `.rules` файла.
+2. **NPM + open-appsec managed-from-npm-ui**, но тут надо учитывать ограничение текущего репозитория: NPM-интеграция редактирует и применяет локальный `local_policy.yaml`, однако поставляемый policy/template использует v1beta1-подобное поле `snort-signatures.configmap`, а не v1beta2 `snortSignatures.files`. Поэтому локальный файл Snort rules через `files` в этом режиме не выглядит поддержанным out-of-the-box.
 
-Этот путь подходит, когда управление идет через UI и в твоей версии UI есть upload Snort rules.
-
-### Путь B: полностью локально через `local_policy.yaml` v1beta2
+### Полностью локально через `local_policy.yaml` v1beta2
 
 Если работаешь без SaaS/UI и хочешь декларативно подключить файл локально, нужен policy-формат, где поддерживается `snortSignatures.files`. Концептуально это выглядит так:
 
@@ -690,3 +684,54 @@ python3 scripts/payloads_to_snort.py \
 - пишет `.rules` файл для ручной ревизии.
 
 После генерации обязательно открой `.rules` и проверь руками. Если есть 100 похожих payloads, лучше заменить их одним аккуратным Snort pattern/regex, чем держать 100 почти одинаковых правил.
+
+## Full local NPM + open-appsec: что реально видно в этом репозитории
+
+Твой желаемый вариант — **NPM + open-appsec полностью локально** — для базового WAF/Detect-Learn/Prevent-Learn в репозитории есть. `docker-compose.yaml` поднимает локальные контейнеры `npm-attachment` и `appsec-agent`, монтирует `./appsec-localconfig` в `/ext/appsec`, а agent получает `autoPolicyLoad=true` и запускается `--standalone`.
+
+Также в NPM UI есть локальная вкладка **Settings → open-appsec Advanced**, которая читает/пишет локальный `/ext/appsec/local_policy.yaml`. Backend route `openappsec-settings` сохраняет YAML на диск, а код NPM-интеграции умеет дергать локальный apply-policy endpoint agent через `127.0.0.1:7777/7778` с `policy_path=/etc/cp/conf/local_policy.yaml`.
+
+Но для **локальных Snort files** есть ограничение:
+
+- текущий `open-appsec-npm-master/deployment/local_policy.yaml` содержит `snort-signatures: configmap: []`;
+- текущий template `local-policy-open-appsec-enabled-for-proxy-host.yaml` тоже генерирует `snort-signatures: configmap: []`;
+- v1beta2-поля `threatPreventionPractices.snortSignatures.files` в NPM шаблонах этого репозитория нет.
+
+Поэтому честный вывод:
+
+1. **Full local NPM + open-appsec для ML/Detect-Learn/Prevent-Learn — да, есть в проекте.**
+2. **Full local NPM + локальный Snort `.rules` через v1beta2 `files` — в текущем managed-from-npm-ui шаблоне не видно как готовая функция.**
+3. Если тебе принципиально нужен Snort `.rules` файл локально и без cloud, самый чистый путь — поднимать open-appsec в режиме, который реально использует v1beta2 local policy, либо дорабатывать NPM-интеграцию/шаблон под v1beta2 и проверять, что agent принимает такой policy.
+
+### Практический план без cloud
+
+1. Поднять локальный NPM + open-appsec как reverse proxy.
+2. Включить нужные hosts в `Detect-Learn` через NPM UI.
+3. Payload runner использовать для проверки detection и сбора логов.
+4. Из curated payloads сгенерировать маленький `.rules` через `payloads_to_snort.py`.
+5. Проверить, есть ли в твоей конкретной локальной версии open-appsec/NPM поддержка v1beta2 local policy с `snortSignatures.files`.
+6. Если поддержки нет — не пытаться пихать `files` в v1beta1 `local_policy.yaml`; вместо этого либо:
+   - перейти на локальный v1beta2 deployment open-appsec без managed-from-npm-ui;
+   - либо доработать NPM-интеграцию, чтобы она генерировала/применяла v1beta2 policy;
+   - либо оставить payloads как regression corpus и использовать встроенный ML/Web Attacks без custom Snort files.
+
+### Что я бы сделал первым
+
+Сначала проверь не Snort, а сам full-local контур:
+
+```bash
+cd /path/to/npm-openappsec-deploy
+docker compose up -d
+curl -i http://127.0.0.1:81
+```
+
+Потом в NPM:
+
+1. Создай Proxy Host.
+2. Включи open-appsec.
+3. Поставь `Detect-Learn`.
+4. Сохрани.
+5. Убедись, что `appsec-localconfig/local_policy.yaml` меняется.
+6. Убедись, что `docker logs appsec-agent` показывает применение policy.
+
+Только после этого имеет смысл заниматься Snort `.rules`.
