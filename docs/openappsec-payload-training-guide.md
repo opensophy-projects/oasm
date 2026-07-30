@@ -735,3 +735,120 @@ curl -i http://127.0.0.1:81
 6. Убедись, что `docker logs appsec-agent` показывает применение policy.
 
 Только после этого имеет смысл заниматься Snort `.rules`.
+
+## Свежий full-local вариант, чтобы v1beta2/Snort files реально заработали
+
+Если цель — **свежие версии проекта, полностью локально, Snort signatures из твоих payloads и применение через CLI**, то приоритетный путь такой:
+
+```text
+[официальный fresh Docker/open-appsec locally managed deployment]
+        + local_policy.yaml v1beta2
+        + snortSignatures.files
+        + open-appsec-ctl --apply-policy
+        + payload_replay_runner.py для проверки expected true/false positive
+```
+
+NPM + open-appsec можно использовать как удобный reverse proxy/WAF UI для обычного `Detect-Learn`/`Prevent-Learn`, но **не делай его обязательным первым шагом для Snort files**, пока не подтверждено, что конкретный NPM образ/шаблон принимает v1beta2 `snortSignatures.files`.
+
+### Рекомендуемая матрица выбора
+
+| Цель | Что выбрать |
+|---|---|
+| Быстро поднять локальный WAF с UI и гонять payloads на detection | NPM + open-appsec managed-from-npm-ui |
+| Локально подключить `.rules` файл через `snortSignatures.files` | Fresh locally managed Docker/Linux open-appsec с v1beta2 policy |
+| Оставить именно NPM и именно локальные Snort files | Проверить поддержку v1beta2 в твоём NPM образе или доработать NPM policy generator/template |
+| Отмечать expected true/false positive через CLI | Делать это во внешнем runner/report; open-appsec CLI применяет policy и показывает логи, а не “обучает label” |
+
+### Минимальный рабочий flow для fresh local v1beta2
+
+1. Поднять свежий локально управляемый open-appsec deployment по официальной Docker/Linux инструкции.
+2. Включить local policy v1beta2.
+3. Сгенерировать маленький Snort rules file из reviewed payloads:
+
+   ```bash
+   python3 scripts/payloads_to_snort.py \
+     --input /tmp/openappsec-payloads-clean/sqli/true-positives.reviewed.txt \
+     --output ./snort/custom-payloads.rules \
+     --sid-start 9100000 \
+     --http-buffer http_uri \
+     --limit 100
+   ```
+
+4. Смонтировать/положить файл так, чтобы agent видел его, например:
+
+   ```text
+   /etc/cp/conf/snort/custom-payloads.rules
+   ```
+
+5. В `local_policy.yaml` v1beta2 подключить файл:
+
+   ```yaml
+   apiVersion: openappsec.io/v1beta2
+   kind: Policy
+   metadata:
+     name: local-policy
+   spec:
+     threatPreventionPractices:
+       - name: webapp-practice
+         snortSignatures:
+           overrideMode: detect
+           files:
+             - /etc/cp/conf/snort/custom-payloads.rules
+   ```
+
+6. Применить policy через CLI:
+
+   ```bash
+   docker exec -it appsec-agent open-appsec-ctl --apply-policy
+   ```
+
+   или внутри Linux/agent host:
+
+   ```bash
+   open-appsec-ctl --apply-policy
+   ```
+
+7. Проверить логи:
+
+   ```bash
+   docker exec -it appsec-agent open-appsec-ctl --view-logs
+   ```
+
+8. Прогнать payloads runner’ом с expected labels:
+
+   ```bash
+   python3 scripts/payload_replay_runner.py \
+     --base-url 'https://waf-train.example.com/search' \
+     --payload-file /tmp/openappsec-payloads-clean/sqli/true-positives.reviewed.txt \
+     --param q \
+     --method GET \
+     --expected-label true-positive \
+     --rate 1 \
+     --limit 50 \
+     --output runs/sqli-snort-detect.jsonl \
+     --i-am-authorized
+   ```
+
+9. Сопоставить `payload_id`/`run_id` с open-appsec logs.
+10. Если true-positive payloads стабильно детектятся и false-positive corpus не срабатывает — перевести `overrideMode` с `detect` на `prevent` и снова применить policy.
+
+### Про “через CLI выбирать true/false positive”
+
+На практике разделяй три вещи:
+
+1. **Policy CLI** — `open-appsec-ctl --apply-policy`: применяет YAML policy.
+2. **Logs CLI** — `open-appsec-ctl --view-logs`: показывает события.
+3. **True/false positive label** — это твоя внешняя expected-разметка в runner/report:
+   - `--expected-label true-positive` для malicious payloads;
+   - `--expected-label false-positive` для benign/legitimate payloads, которые WAF не должен ловить.
+
+Если в твоей свежей версии open-appsec появится CLI-команда для feedback/label ingestion, её нужно проверять отдельно по `open-appsec-ctl --help`. В доступной документации по `open-appsec-ctl` основной надежный локальный сценарий — применить policy и смотреть логи; поэтому в этом гайде true/false positive хранится во внешнем JSONL/CSV отчете runner’а.
+
+### Где здесь NPM
+
+Если NPM тебе важен, используй его в одном из двух режимов:
+
+1. **NPM как первый локальный WAF стенд**: быстро поднять, включить `Detect-Learn`, гонять payloads runner’ом, анализировать логи.
+2. **NPM как reverse proxy перед fresh local open-appsec/v1beta2 контуром**: если сможешь собрать поддерживаемую схему attachment/agent так, чтобы agent применял v1beta2 policy с `snortSignatures.files`.
+
+Но для первого реально работающего Snort/v1beta2 результата я бы не начинал с доработки NPM. Сначала докажи на fresh local v1beta2 deployment, что `.rules` файл применяется и детектит payloads. Потом уже переносить этот механизм в NPM-контур.
