@@ -1,6 +1,6 @@
 # Full-local nginx + open-appsec v1beta2: установка, Snort signatures из payloads и локальный true/false-positive workflow
 
-Цель этого гайда: поднять **полностью локальный** стек `nginx + open-appsec`, перейти на **Local Policy File v1beta2**, подключить свои payloads как **Snort signatures**, прогонять проверки и локально разбирать true/false positive без cloud.
+Цель этого гайда: поднять **полностью локальный** стек `nginx + open-appsec`, сразу создать **Local Policy File v1beta2**, подключить свои payloads как **Snort signatures**, прогонять проверки и локально разбирать true/false positive без cloud.
 
 > Важно: payloads не “скармливаются ML-модели” как обучение. Для детерминированного блокирования payloads их надо превращать в Snort/custom signatures и подключать через `snortSignatures.files` в v1beta2 policy.
 
@@ -57,15 +57,15 @@ sudo open-appsec-ctl --view-logs
 ./openappsec/logs  -> /var/log/nano_agent
 ```
 
-Файл `local_policy.yaml` должен лежать в mounted config directory, чтобы ты мог заменить его на v1beta2 и применять через:
+Файл `local_policy.yaml` сразу должен быть v1beta2 и лежать в mounted config directory, чтобы применять его через:
 
 ```bash
 docker exec -it appsec-agent open-appsec-ctl --apply-policy
 ```
 
-## 2. Перейти на Local Policy File v1beta2
+## 2. Сразу создать Local Policy File v1beta2
 
-Скачай официальный пример v1beta2 policy:
+С нуля создай локальную конфигурацию сразу на v1beta2. Самый быстрый старт — скачать официальный пример v1beta2 policy:
 
 ```bash
 mkdir -p ./openappsec/conf/snort ./openappsec/data ./openappsec/logs
@@ -489,7 +489,7 @@ wget https://downloads.openappsec.io/open-appsec-install
 chmod +x open-appsec-install
 sudo ./open-appsec-install --auto
 
-# 2. скачать v1beta2 policy
+# 2. сразу создать v1beta2 policy
 mkdir -p ./openappsec/conf/snort ./payloads-reviewed/sqli ./runs
 wget https://raw.githubusercontent.com/openappsec/openappsec/main/config/linux/v1beta2/example/local_policy.yaml \
   -O ./openappsec/conf/local_policy.yaml
@@ -509,7 +509,7 @@ python3 scripts/payloads_to_snort.py \
 sudo mkdir -p /etc/cp/conf/snort
 sudo cp ./openappsec/conf/snort/custom-payloads.rules /etc/cp/conf/snort/custom-payloads.rules
 
-# 6. отредактировать policy: apiVersion v1beta2 + snortSignatures.files
+# 6. отредактировать уже v1beta2 policy: snortSignatures.files
 sudo open-appsec-ctl --edit-policy
 
 # 7. применить
