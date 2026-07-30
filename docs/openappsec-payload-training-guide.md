@@ -587,3 +587,106 @@ python3 scripts/payload_replay_runner.py --help
 - держи regression-набор payloads, который проверяет, что custom rule реально срабатывает.
 
 Итого: runner нужен не чтобы “скормить open-appsec 1,8 млн атак и обучить его”, а чтобы **изолированно и воспроизводимо проверить**, что open-appsec видит нужные атаки, а затем принять решение: tuning, exception, Snort/custom signature, policy change или bug/regression report.
+
+## Если цель — именно “закинуть payloads” в open-appsec как Snort/custom signatures
+
+Да, такой путь есть, но это **не загрузка сырых payloads в ML-модель**. Это отдельный механизм IPS/Snort signatures: ты превращаешь выбранные payloads или устойчивые паттерны в Snort rules и подключаешь их к practice/policy.
+
+### Важное ограничение
+
+Не конвертируй все `1,845,231` строк в `1,845,231` Snort rules. Это будет тяжелый, шумный и плохо сопровождаемый набор. Правильный вариант:
+
+1. взять маленький curated-набор или конкретные CVE/patterns;
+2. объединить похожие строки в один устойчивый pattern/regex, если это возможно;
+3. сначала включить rules в Detect;
+4. прогнать false-positive набор;
+5. только потом переводить в Prevent.
+
+### Путь A: upload Snort-файла через WebUI
+
+Если ты используешь WebUI/Management Portal, рабочий сценарий такой:
+
+1. Открыть нужный Asset.
+2. Перейти в Web Attacks / Snort Signatures / IPS sub-practice.
+3. Загрузить `.rules` файл.
+4. Поставить режим Detect или Prevent.
+5. Нажать Enforce.
+6. Проверить Security Logs на маленьком smoke-наборе.
+
+Этот путь подходит, когда управление идет через UI и в твоей версии UI есть upload Snort rules.
+
+### Путь B: полностью локально через `local_policy.yaml` v1beta2
+
+Если работаешь без SaaS/UI и хочешь декларативно подключить файл локально, нужен policy-формат, где поддерживается `snortSignatures.files`. Концептуально это выглядит так:
+
+```yaml
+apiVersion: openappsec.io/v1beta2
+kind: Policy
+metadata:
+  name: local-policy
+spec:
+  threatPreventionPractices:
+    - name: webapp-practice
+      snortSignatures:
+        overrideMode: detect
+        files:
+          - /etc/cp/conf/snort/custom-payloads.rules
+```
+
+После изменения policy файл правил должен быть доступен внутри agent container/host по тому же пути, а policy надо применить:
+
+```bash
+open-appsec-ctl --apply-policy
+```
+
+Для Docker это обычно означает:
+
+1. положить `custom-payloads.rules` в persistent config directory на host;
+2. смонтировать его в контейнер agent;
+3. сослаться на этот путь в `local_policy.yaml`;
+4. применить policy;
+5. проверить логи.
+
+### Важное про NPM integration
+
+В текущих файлах `open-appsec-npm-master/deployment/local_policy.yaml` и шаблонах NPM-интеграции используется v1beta1-подобная структура с `snort-signatures: configmap: []`, а не v1beta2 `snortSignatures.files`. Поэтому:
+
+- через **managed-from-npm-ui** может не получиться просто дописать `files` в `local_policy.yaml`;
+- если нужен именно локальный Snort rules file, смотри вариант open-appsec/NPM, совместимый с centrally managed/v1beta2 policy, или используй WebUI upload;
+- не смешивай blindly v1beta1 и v1beta2 поля в одном policy.
+
+### Конвертация маленького payload-файла в Snort rules
+
+В репозиторий добавлен helper `scripts/payloads_to_snort.py`. Он нужен для curated-файла, а не для всей сырой папки.
+
+Пример:
+
+```bash
+python3 scripts/payloads_to_snort.py \
+  --input /tmp/openappsec-payloads-clean/sqli/true-positives.reviewed.txt \
+  --output /tmp/custom-payloads.rules \
+  --sid-start 9100000 \
+  --http-buffer http_uri \
+  --limit 100
+```
+
+Для payloads в POST body:
+
+```bash
+python3 scripts/payloads_to_snort.py \
+  --input /tmp/openappsec-payloads-clean/sqli/true-positives.reviewed.txt \
+  --output /tmp/custom-payloads-body.rules \
+  --sid-start 9110000 \
+  --http-buffer http_client_body \
+  --limit 100
+```
+
+Что делает helper:
+
+- пропускает пустые строки и комментарии;
+- убирает точные дубли;
+- генерирует `alert http` rules с локальными `sid`;
+- экранирует кавычки, обратные слэши и `;`;
+- пишет `.rules` файл для ручной ревизии.
+
+После генерации обязательно открой `.rules` и проверь руками. Если есть 100 похожих payloads, лучше заменить их одним аккуратным Snort pattern/regex, чем держать 100 почти одинаковых правил.
