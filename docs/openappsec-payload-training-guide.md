@@ -1,107 +1,151 @@
-# Full-local nginx + open-appsec v1beta2: установка, Snort signatures из payloads и локальный true/false-positive workflow
+# One-PC Docker guide: nginx + open-appsec v1beta2 + local Snort signatures
 
-Цель этого гайда: поднять **полностью локальный** стек `nginx + open-appsec`, сразу создать **Local Policy File v1beta2**, подключить свои payloads как **Snort signatures**, прогонять проверки и локально разбирать true/false positive без cloud.
-
-> Важно: payloads не “скармливаются ML-модели” как обучение. Для детерминированного блокирования payloads их надо превращать в Snort/custom signatures и подключать через `snortSignatures.files` в v1beta2 policy.
-
-## 0. Что получится в итоге
+Этот гайд рассчитан на ситуацию: **на твоём ПК установлен только Docker**. Ниже есть copy-paste блок, который с нуля создаёт локальный стек:
 
 ```text
-[client / payload runner]
-        -> [nginx attachment]
-        -> [open-appsec agent]
-        -> [your upstream app]
+localhost:80
+  -> appsec-nginx attachment
+  -> appsec-agent
+  -> juice-shop test backend
 
-local files:
-  ./openappsec/conf/local_policy.yaml
-  ./openappsec/conf/snort/custom-payloads.rules
-  ./openappsec/data/
-  ./openappsec/logs/
+local policy: v1beta2
+signatures: /etc/cp/conf/snort/custom-payloads.rules
+режим сначала: detect-learn / snort detect
 ```
 
-Управление:
+> Сначала подними это как локальный тест. После проверки меняй backend/host под свой сервис.
+
+## 1. Copy-paste: создать и запустить весь локальный стек
+
+Скопируй весь блок в терминал на своём ПК:
 
 ```bash
-open-appsec-ctl --edit-policy
-open-appsec-ctl --apply-policy
-open-appsec-ctl --view-logs
-./open-appsec-tuning-tool
-```
+set -e
 
-## 1. Поставить nginx + open-appsec локально
+mkdir -p ~/oas-local-v1beta2
+cd ~/oas-local-v1beta2
 
-### Вариант Linux installer
+mkdir -p \
+  appsec-config/snort \
+  appsec-localconfig \
+  appsec-data \
+  appsec-logs \
+  appsec-smartsync-storage \
+  appsec-postgres-data \
+  nginx-config \
+  payloads-reviewed/sqli \
+  runs
 
-На сервере с nginx:
+cat > docker-compose.yaml <<'YAML'
+services:
+  appsec-agent:
+    image: ghcr.io/openappsec/agent:latest
+    container_name: appsec-agent
+    ipc: host
+    restart: unless-stopped
+    environment:
+      - SHARED_STORAGE_HOST=appsec-shared-storage
+      - LEARNING_HOST=appsec-smartsync
+      - TUNING_HOST=appsec-tuning-svc
+      - user_email=local@example.local
+      - autoPolicyLoad=true
+      - registered_server=NGINX
+    volumes:
+      - ./appsec-config:/etc/cp/conf
+      - ./appsec-data:/etc/cp/data
+      - ./appsec-logs:/var/log/nano_agent
+      - ./appsec-localconfig:/ext/appsec
+      - shm-volume:/dev/shm/check-point
+    command: /cp-nano-agent
 
-```bash
-wget https://downloads.openappsec.io/open-appsec-install
-chmod +x open-appsec-install
-sudo ./open-appsec-install --auto
-```
+  appsec-nginx:
+    image: ghcr.io/openappsec/nginx-attachment:latest
+    container_name: appsec-nginx
+    ipc: host
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx-config:/etc/nginx/conf.d
+      - shm-volume:/dev/shm/check-point
+    depends_on:
+      - appsec-agent
+      - juiceshop-backend
 
-После установки проверь agent/CLI:
+  appsec-smartsync:
+    image: ghcr.io/openappsec/smartsync:latest
+    container_name: appsec-smartsync
+    restart: unless-stopped
+    environment:
+      - SHARED_STORAGE_HOST=appsec-shared-storage
+    depends_on:
+      - appsec-shared-storage
 
-```bash
-sudo open-appsec-ctl --status
-sudo open-appsec-ctl --view-logs
-```
+  appsec-shared-storage:
+    image: ghcr.io/openappsec/smartsync-shared-files:latest
+    container_name: appsec-shared-storage
+    ipc: host
+    restart: unless-stopped
+    user: root
+    volumes:
+      - ./appsec-smartsync-storage:/db:z
 
-### Вариант Docker
+  appsec-tuning-svc:
+    image: ghcr.io/openappsec/smartsync-tuning:latest
+    container_name: appsec-tuning-svc
+    restart: unless-stopped
+    environment:
+      - SHARED_STORAGE_HOST=appsec-shared-storage
+      - QUERY_DB_PASSWORD=pass
+      - QUERY_DB_HOST=appsec-db
+      - QUERY_DB_USER=postgres
+    volumes:
+      - ./appsec-config:/etc/cp/conf
+    depends_on:
+      - appsec-shared-storage
+      - appsec-db
 
-Для Docker используй официальный Docker deployment open-appsec, но сразу планируй persistent volumes:
+  appsec-db:
+    image: postgres:18
+    container_name: appsec-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_USER=postgres
+    volumes:
+      - ./appsec-postgres-data:/var/lib/postgresql
 
-```text
-./openappsec/conf  -> /etc/cp/conf
-./openappsec/data  -> /etc/cp/data
-./openappsec/logs  -> /var/log/nano_agent
-```
+  juiceshop-backend:
+    image: bkimminich/juice-shop:latest
+    container_name: juiceshop-backend
+    restart: unless-stopped
 
-Файл `local_policy.yaml` сразу должен быть v1beta2 и лежать в mounted config directory, чтобы применять его через:
+volumes:
+  shm-volume:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+YAML
 
-```bash
-docker exec -it appsec-agent open-appsec-ctl --apply-policy
-```
+cat > nginx-config/default.conf <<'NGINX'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
 
-## 2. Сразу создать Local Policy File v1beta2
+    location / {
+        proxy_pass http://juiceshop-backend:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGINX
 
-С нуля создай локальную конфигурацию сразу на v1beta2. Самый быстрый старт — скачать официальный пример v1beta2 policy:
-
-```bash
-mkdir -p ./openappsec/conf/snort ./openappsec/data ./openappsec/logs
-wget https://raw.githubusercontent.com/openappsec/openappsec/main/config/linux/v1beta2/example/local_policy.yaml \
-  -O ./openappsec/conf/local_policy.yaml
-```
-
-Для Linux deployment можно открыть policy через CLI:
-
-```bash
-sudo open-appsec-ctl --edit-policy
-```
-
-Для Docker deployment замени mounted файл:
-
-```bash
-cp ./openappsec/conf/local_policy.yaml /path/to/mounted/local_policy.yaml
-```
-
-После любой правки применяй policy:
-
-```bash
-sudo open-appsec-ctl --apply-policy
-```
-
-или для Docker:
-
-```bash
-docker exec -it appsec-agent open-appsec-ctl --apply-policy
-```
-
-## 3. Минимальный v1beta2 policy для Detect-Learn + Snort file
-
-Ниже минимальный пример. Его можно использовать как стартовый шаблон и адаптировать hostname/upstream под свою схему.
-
-```yaml
+cat > appsec-config/local_policy.yaml <<'YAML'
 apiVersion: v1beta2
 
 policies:
@@ -185,351 +229,334 @@ customResponses:
   - name: web-user-response
     mode: response-code-only
     httpResponseCode: 403
+YAML
+
+# Дублируем policy в /ext/appsec на случай autoPolicyLoad-логики образа.
+cp appsec-config/local_policy.yaml appsec-localconfig/local_policy.yaml
+
+cat > appsec-config/snort/custom-payloads.rules <<'RULES'
+# Local reviewed Snort signatures. Start in detect mode in local_policy.yaml.
+alert http any any -> any any (msg:"local reviewed SQLi test 1"; flow:to_server; content:"1 OR 1=1"; http_uri; classtype:web-application-attack; sid:9100000; rev:1;)
+alert http any any -> any any (msg:"local reviewed traversal test 1"; flow:to_server; content:"../etc/passwd"; http_uri; classtype:web-application-attack; sid:9100001; rev:1;)
+RULES
+
+cat > payloads-reviewed/sqli/true-positives.reviewed.txt <<'PAYLOADS'
+1 OR 1=1
+../etc/passwd
+PAYLOADS
+
+docker compose up -d
+
+echo
+
+echo '=== containers ==='
+docker compose ps
+
+echo
+
+echo '=== wait 30s, then apply policy ==='
+sleep 30
+docker exec appsec-agent open-appsec-ctl --apply-policy || true
+
+echo
+
+echo '=== smoke requests ==='
+curl -i 'http://127.0.0.1/' | head -20 || true
+curl -i --get --data-urlencode 'q=1 OR 1=1' 'http://127.0.0.1/search' | head -30 || true
+
+echo
+
+echo '=== appsec logs tail ==='
+docker logs appsec-agent --tail=120 || true
 ```
 
-Проверка:
+## 2. Что должно появиться
+
+После запуска проверь:
 
 ```bash
-sudo open-appsec-ctl --apply-policy
-sudo open-appsec-ctl --view-logs
+cd ~/oas-local-v1beta2
+docker compose ps
 ```
 
-Docker:
-
-```bash
-docker exec -it appsec-agent open-appsec-ctl --apply-policy
-docker logs appsec-agent --tail=200
-```
-
-## 4. Подготовить payloads
-
-Не подключай сырую папку `newpayloads-newpayloads` целиком. Сначала сделай reviewed набор.
-
-Пример структуры:
-
-```bash
-mkdir -p ./payloads-reviewed/sqli ./payloads-reviewed/cmdexe ./payloads-reviewed/ssrf
-```
-
-Положи туда только payloads, которые ты реально хочешь превратить в signatures:
+Ожидаемые контейнеры:
 
 ```text
-./payloads-reviewed/sqli/true-positives.reviewed.txt
-./payloads-reviewed/cmdexe/true-positives.reviewed.txt
-./payloads-reviewed/ssrf/true-positives.reviewed.txt
+appsec-agent
+appsec-nginx
+appsec-smartsync
+appsec-shared-storage
+appsec-tuning-svc
+appsec-db
+juiceshop-backend
 ```
 
-Правило отбора:
-
-```text
-1 строка = 1 проверяемый payload/pattern
-без мусора
-без wordlists usernames/user-agents
-без web-shell файлов целиком
-без бинарей/архивов
-без дублей
-```
-
-## 5. Сгенерировать Snort signatures из reviewed payloads
-
-В репозитории есть helper:
+Проверка HTTP:
 
 ```bash
-python3 scripts/payloads_to_snort.py --help
+curl -i http://127.0.0.1/
 ```
 
-Для URI/query payloads:
+Проверка payload:
 
 ```bash
-python3 scripts/payloads_to_snort.py \
-  --input ./payloads-reviewed/sqli/true-positives.reviewed.txt \
-  --output ./openappsec/conf/snort/custom-payloads.rules \
-  --sid-start 9100000 \
-  --http-buffer http_uri \
-  --limit 100
+curl -i --get --data-urlencode 'q=1 OR 1=1' 'http://127.0.0.1/search'
 ```
 
-Для POST body payloads:
-
-```bash
-python3 scripts/payloads_to_snort.py \
-  --input ./payloads-reviewed/sqli/true-positives.reviewed.txt \
-  --output ./openappsec/conf/snort/custom-payloads-body.rules \
-  --sid-start 9110000 \
-  --http-buffer http_client_body \
-  --limit 100
-```
-
-Если v1beta2 поддерживает только `0 or 1 files` в `snortSignatures.files`, объедини rules в один файл:
-
-```bash
-cat ./openappsec/conf/snort/*.rules > ./openappsec/conf/snort/custom-payloads.rules
-```
-
-И в policy укажи один файл:
-
-```yaml
-snortSignatures:
-  overrideMode: detect
-  configmap: []
-  files:
-    - /etc/cp/conf/snort/custom-payloads.rules
-```
-
-## 6. Куда класть signatures
-
-### Linux
-
-```bash
-sudo mkdir -p /etc/cp/conf/snort
-sudo cp ./openappsec/conf/snort/custom-payloads.rules /etc/cp/conf/snort/custom-payloads.rules
-sudo open-appsec-ctl --apply-policy
-```
-
-### Docker
-
-Если volume смонтирован так:
-
-```text
-./openappsec/conf -> /etc/cp/conf
-```
-
-то файл на host:
-
-```text
-./openappsec/conf/snort/custom-payloads.rules
-```
-
-будет виден agent как:
-
-```text
-/etc/cp/conf/snort/custom-payloads.rules
-```
-
-Применить:
-
-```bash
-docker exec -it appsec-agent open-appsec-ctl --apply-policy
-```
-
-## 7. Проверить, что signatures применились
-
-```bash
-sudo open-appsec-ctl --view-logs
-```
-
-Docker:
+В режиме `detect-learn` ответ может быть `200`. Смотри именно security event в логах:
 
 ```bash
 docker logs appsec-agent --tail=300
 ```
 
-Потом отправь тестовый payload:
+## 3. Где лежат главные файлы
 
-```bash
-curl -i 'https://your-host.example/search?q=1%20OR%201=1'
+```text
+~/oas-local-v1beta2/docker-compose.yaml
+~/oas-local-v1beta2/nginx-config/default.conf
+~/oas-local-v1beta2/appsec-config/local_policy.yaml
+~/oas-local-v1beta2/appsec-localconfig/local_policy.yaml
+~/oas-local-v1beta2/appsec-config/snort/custom-payloads.rules
+~/oas-local-v1beta2/payloads-reviewed/sqli/true-positives.reviewed.txt
+~/oas-local-v1beta2/runs/
 ```
 
-В `detect`/`detect-learn` HTTP-ответ может быть `200`; важен security event в логах. В `prevent`/`prevent-learn` ожидай блокировку, обычно `403`.
+Главный policy файл внутри agent:
 
-## 8. Запустить массовую проверку payloads
+```text
+/etc/cp/conf/local_policy.yaml
+```
 
-Runner нужен для воспроизводимого теста и корреляции с логами.
+Главный signatures файл внутри agent:
+
+```text
+/etc/cp/conf/snort/custom-payloads.rules
+```
+
+## 4. Как добавить свои payloads в signatures
+
+Открой reviewed payload file:
+
+```bash
+cd ~/oas-local-v1beta2
+nano payloads-reviewed/sqli/true-positives.reviewed.txt
+```
+
+Пример:
+
+```text
+1 OR 1=1
+' OR '1'='1
+../etc/passwd
+```
+
+Если у тебя есть этот репозиторий и Python, сгенерируй Snort rules helper-ом:
+
+```bash
+python3 scripts/payloads_to_snort.py \
+  --input ~/oas-local-v1beta2/payloads-reviewed/sqli/true-positives.reviewed.txt \
+  --output ~/oas-local-v1beta2/appsec-config/snort/custom-payloads.rules \
+  --sid-start 9100000 \
+  --http-buffer http_uri \
+  --limit 100
+```
+
+Если Python/репозитория на этом ПК нет, добавляй rules руками в файл:
+
+```bash
+nano ~/oas-local-v1beta2/appsec-config/snort/custom-payloads.rules
+```
+
+Формат одной простой HTTP URI сигнатуры:
+
+```text
+alert http any any -> any any (msg:"local reviewed payload"; flow:to_server; content:"PAYLOAD_HERE"; http_uri; classtype:web-application-attack; sid:9100100; rev:1;)
+```
+
+После правки применить policy:
+
+```bash
+cd ~/oas-local-v1beta2
+docker exec appsec-agent open-appsec-ctl --apply-policy
+```
+
+## 5. Как массово прогнать payloads без Python
+
+Раз у тебя на ПК есть только Docker, можно прогонять через shell + curl:
+
+```bash
+cd ~/oas-local-v1beta2
+RUN_ID="oas-$(date +%s)"
+i=0
+mkdir -p runs
+: > "runs/${RUN_ID}.jsonl"
+
+while IFS= read -r payload; do
+  [ -z "$payload" ] && continue
+  case "$payload" in \#*) continue ;; esac
+  i=$((i+1))
+  PID="${RUN_ID}-$(printf '%06d' "$i")"
+  code=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "X-OAS-Test-Run: ${RUN_ID}" \
+    -H "X-OAS-Payload-Id: ${PID}" \
+    -H "X-OAS-Expected-Label: true-positive" \
+    --get --data-urlencode "q=${payload}" \
+    'http://127.0.0.1/search' || true)
+  printf '{"run_id":"%s","payload_id":"%s","expected_label":"true-positive","status":"%s"}\n' \
+    "$RUN_ID" "$PID" "$code" | tee -a "runs/${RUN_ID}.jsonl"
+  sleep 1
+done < payloads-reviewed/sqli/true-positives.reviewed.txt
+
+echo "RUN_ID=${RUN_ID}"
+```
+
+Ищи события:
+
+```bash
+docker logs appsec-agent --tail=1000 | grep "$RUN_ID" || true
+```
+
+## 6. Как массово прогнать payloads через payload_replay_runner.py
+
+Если у тебя есть этот репозиторий и Python:
 
 ```bash
 python3 scripts/payload_replay_runner.py \
-  --base-url 'https://your-host.example/search' \
-  --payload-file ./payloads-reviewed/sqli/true-positives.reviewed.txt \
+  --base-url 'http://127.0.0.1/search' \
+  --payload-file ~/oas-local-v1beta2/payloads-reviewed/sqli/true-positives.reviewed.txt \
   --param q \
   --method GET \
   --expected-label true-positive \
   --rate 1 \
   --limit 50 \
-  --output ./runs/sqli-detect.jsonl \
+  --output ~/oas-local-v1beta2/runs/sqli-detect.jsonl \
   --i-am-authorized
 ```
 
-Runner добавляет заголовки:
+## 7. Как локально выбирать true/false positive
 
-```text
-X-OAS-Test-Run
-X-OAS-Payload-Id
-X-OAS-Expected-Label
-```
-
-По ним ищи события в логах:
-
-```bash
-docker logs appsec-agent --tail=1000 | grep 'X-OAS-Test-Run\|oas-'
-```
-
-## 9. Как локально работать с true/false positive
-
-Есть два разных уровня.
-
-### Уровень A: expected labels в runner
+### Вариант 1: expected labels в прогоне
 
 Для malicious payloads:
 
-```bash
---expected-label true-positive
+```text
+X-OAS-Expected-Label: true-positive
 ```
 
-Для benign payloads, которые WAF не должен ловить:
+Для benign payloads:
 
-```bash
---expected-label false-positive
+```text
+X-OAS-Expected-Label: false-positive
 ```
 
-Итоговая логика:
+Таблица разбора:
 
-| Expected | Open-appsec event | Вывод |
+| Expected | Есть open-appsec event | Вывод |
 |---|---|---|
-| true-positive | есть detect/prevent event | OK |
-| true-positive | нет event | false negative |
-| false-positive | есть detect/prevent event | false positive |
-| false-positive | нет event | OK |
+| true-positive | да | OK |
+| true-positive | нет | false negative |
+| false-positive | да | false positive |
+| false-positive | нет | OK |
 
-### Уровень B: локальное tuning через CLI/tool
+### Вариант 2: open-appsec-tuning-tool, если есть в контейнере
 
-Если в твоей standalone/local установке есть `open-appsec-tuning-tool`, используй его для локальных tuning suggestions:
-
-```bash
-sudo ./open-appsec-tuning-tool
-```
-
-Или найди его:
+Найти tool:
 
 ```bash
-which open-appsec-tuning-tool || sudo find / -name 'open-appsec-tuning-tool' 2>/dev/null
+docker exec -it appsec-agent sh -lc 'command -v open-appsec-tuning-tool || find / -name open-appsec-tuning-tool 2>/dev/null | head'
 ```
 
-Дальше общий workflow:
+Запустить, если найден:
+
+```bash
+docker exec -it appsec-agent sh -lc 'open-appsec-tuning-tool || /open-appsec-tuning-tool'
+```
+
+Внутри tool логика такая:
 
 ```text
-[2] Manage tuning suggestions for learning
-выбрать suggestion
-посмотреть связанные логи
-решить: malicious или benign
+Manage tuning suggestions for learning
+malicious = реальная атака / true positive
+benign    = легитимно / false positive
 ```
 
-Смысл:
+Если tool отсутствует в конкретном образе, веди true/false positive через `runs/*.jsonl` и логи agent.
 
-```text
-malicious = это реальная атака / true positive
-benign    = это легитимно / false positive
+## 8. Перевести Snort signatures из detect в prevent
+
+Открой policy:
+
+```bash
+nano ~/oas-local-v1beta2/appsec-config/local_policy.yaml
 ```
 
-Если `open-appsec-tuning-tool` в твоей версии отсутствует, остаётся внешний runner/report + правки policy/exceptions/signatures.
+Замени:
 
-## 10. Перевести signatures из Detect в Prevent
+```yaml
+snortSignatures:
+  overrideMode: detect
+```
 
-Когда Snort signatures проверены:
+на:
 
 ```yaml
 snortSignatures:
   overrideMode: prevent
-  configmap: []
-  files:
-    - /etc/cp/conf/snort/custom-payloads.rules
 ```
 
-Применить:
+Синхронизируй копию и примени:
 
 ```bash
-sudo open-appsec-ctl --apply-policy
+cd ~/oas-local-v1beta2
+cp appsec-config/local_policy.yaml appsec-localconfig/local_policy.yaml
+docker exec appsec-agent open-appsec-ctl --apply-policy
 ```
 
-Docker:
+Проверь payload ещё раз:
 
 ```bash
-docker exec -it appsec-agent open-appsec-ctl --apply-policy
+curl -i --get --data-urlencode 'q=1 OR 1=1' 'http://127.0.0.1/search'
+docker logs appsec-agent --tail=300
 ```
 
-Снова прогнать runner и убедиться, что malicious payloads блокируются, а benign corpus не ловится.
+## 9. Остановить / удалить стенд
 
-## 11. Где здесь NPM
+Остановить:
 
-Если нужен именно NPM, используй его как отдельный следующий этап.
-
-Сначала добейся, чтобы работал чистый full-local контур:
-
-```text
-nginx + open-appsec + v1beta2 + snortSignatures.files
+```bash
+cd ~/oas-local-v1beta2
+docker compose down
 ```
 
-Потом переносить в NPM.
+Удалить данные полностью:
 
-Причина: текущий `open-appsec-npm-master` в этом репозитории использует v1beta1-style:
+```bash
+cd ~
+rm -rf ~/oas-local-v1beta2
+```
+
+## 10. Когда переносить на свой сервис
+
+После того как локально работает Juice Shop:
+
+1. Замени `proxy_pass http://juiceshop-backend:3000;` в `nginx-config/default.conf` на свой upstream.
+2. Перезапусти nginx:
+
+```bash
+cd ~/oas-local-v1beta2
+docker compose restart appsec-nginx
+```
+
+3. Сначала оставь:
 
 ```yaml
-snort-signatures:
-  configmap: []
-```
+policies:
+  default:
+    mode: detect-learn
 
-а тебе нужен v1beta2-style:
-
-```yaml
 snortSignatures:
-  files:
-    - /etc/cp/conf/snort/custom-payloads.rules
+  overrideMode: detect
 ```
 
-Поэтому для NPM есть 3 варианта:
-
-1. найти свежий NPM/open-appsec image, который уже поддерживает v1beta2 local policy;
-2. доработать NPM policy template/generator под v1beta2;
-3. оставить NPM для обычного Detect-Learn/Web Attacks, а Snort files держать в отдельном local v1beta2 контуре.
-
-## 12. Минимальная последовательность команд
-
-```bash
-# 1. поставить open-appsec
-wget https://downloads.openappsec.io/open-appsec-install
-chmod +x open-appsec-install
-sudo ./open-appsec-install --auto
-
-# 2. сразу создать v1beta2 policy
-mkdir -p ./openappsec/conf/snort ./payloads-reviewed/sqli ./runs
-wget https://raw.githubusercontent.com/openappsec/openappsec/main/config/linux/v1beta2/example/local_policy.yaml \
-  -O ./openappsec/conf/local_policy.yaml
-
-# 3. подготовить reviewed payloads
-nano ./payloads-reviewed/sqli/true-positives.reviewed.txt
-
-# 4. сгенерировать signatures
-python3 scripts/payloads_to_snort.py \
-  --input ./payloads-reviewed/sqli/true-positives.reviewed.txt \
-  --output ./openappsec/conf/snort/custom-payloads.rules \
-  --sid-start 9100000 \
-  --http-buffer http_uri \
-  --limit 100
-
-# 5. скопировать signatures в agent config
-sudo mkdir -p /etc/cp/conf/snort
-sudo cp ./openappsec/conf/snort/custom-payloads.rules /etc/cp/conf/snort/custom-payloads.rules
-
-# 6. отредактировать уже v1beta2 policy: snortSignatures.files
-sudo open-appsec-ctl --edit-policy
-
-# 7. применить
-sudo open-appsec-ctl --apply-policy
-
-# 8. проверить логи
-sudo open-appsec-ctl --view-logs
-
-# 9. прогнать payloads
-python3 scripts/payload_replay_runner.py \
-  --base-url 'https://your-host.example/search' \
-  --payload-file ./payloads-reviewed/sqli/true-positives.reviewed.txt \
-  --param q \
-  --method GET \
-  --expected-label true-positive \
-  --rate 1 \
-  --limit 50 \
-  --output ./runs/sqli-detect.jsonl \
-  --i-am-authorized
-
-# 10. tuning если доступен
-sudo ./open-appsec-tuning-tool
-```
+4. Прогони benign и malicious payloads.
+5. Только потом переводи signatures в `prevent`.
